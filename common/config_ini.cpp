@@ -22,11 +22,13 @@ auto config_ini::parse(std::istream& iss)
 {
 	std::string line_s;
 	std::string section_s;
+	std::size_t line_no{ 0 };
 	while (std::getline(iss, line_s))
 	{		
 		if (line_s.empty())
 			continue;
-		parse_line(line_s, section_s);
+		line_no += 1;
+		parse_line(line_s, section_s, line_no);	
 	}
 	return *this;
 }
@@ -67,7 +69,7 @@ auto config_ini::value(accessor_type index) const -> std::optional<std::string_v
 	return std::nullopt;
 }
 
-auto config_ini::parse_line(std::string_view line_sv, std::string& section) -> config_ini&
+auto config_ini::parse_line(std::string_view line_sv, std::string& section, std::size_t line_no) -> config_ini&
 {
 	using namespace std::string_view_literals;
 	using namespace std::string_literals;
@@ -76,7 +78,7 @@ auto config_ini::parse_line(std::string_view line_sv, std::string& section) -> c
 	static const auto re_kv_pair = std::regex(R"(^([^=]+)=(.*)$)", std::regex::optimize);
 
 	std::string_view::size_type pos;	
-	pos = line_sv.find('#');	
+	pos = line_sv.find(';');	
 	if (pos != line_sv.npos)
 		line_sv.remove_suffix(line_sv.size() - pos);
 	trim (line_sv);		
@@ -109,13 +111,21 @@ auto config_ini::parse_line(std::string_view line_sv, std::string& section) -> c
 		m_data[section][std::string(key)] = std::string(val);
 		return *this;
 	}
-	throw std::runtime_error("Bad line : "s + std::string(line_sv));		
+	if (line_no != 0)
+	{
+		throw std::runtime_error(std::format(
+			"Bad line nr {} : {}", line_no, line_sv
+		));		
+	}
+	throw std::runtime_error(std::format(
+		"Bad config directive : {}", line_sv
+	));
 }
 
 
 auto config_ini::insert_line(std::string_view line_sv, std::string_view section_in) -> config_ini&
 {
 	std::string section_v (section_in);
-	parse_line(line_sv, section_v);	
+	parse_line(line_sv, section_v, 0);	
 	return *this;
 }

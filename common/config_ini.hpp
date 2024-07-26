@@ -73,7 +73,7 @@ struct config_ini
 	auto insert_line(std::string_view line_sv, std::string_view section = "") -> config_ini&;
 
 protected:
-	auto parse_line(std::string_view line_sv, std::string& section_s) -> config_ini&;
+	auto parse_line(std::string_view line_sv, std::string& section_s, std::size_t line_no) -> config_ini&;
 	
 private:
 	std::unordered_map<std::string, std::unordered_map<std::string, std::string>> m_data;

@@ -13,7 +13,11 @@ static inline void ltrim(std::string_view& sv)
 	if (sv.empty())
 		return;	
 	auto pos = sv.find_first_not_of(" \t\n\r\f\v"sv);	
-	sv.remove_prefix(pos);
+	if (pos != sv.npos) {
+		sv.remove_prefix(pos);
+	} else {
+		sv.remove_prefix(sv.size());
+	}
 }
 
 static inline void rtrim(std::string_view& sv)
@@ -22,7 +26,11 @@ static inline void rtrim(std::string_view& sv)
 	if (sv.empty())
 		return;
 	auto pos = sv.find_last_not_of(" \t\n\r\f\v"sv);
-	sv.remove_suffix(sv.size() - pos - 1u);
+	if (pos != sv.npos) {
+		sv.remove_suffix(sv.size() - pos - 1u);
+	} else {
+		sv.remove_suffix(sv.size());
+	}
 }
 
 static inline void trim(std::string_view& sv)

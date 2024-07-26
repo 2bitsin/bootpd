@@ -24,9 +24,9 @@ int main(int argc, char** argv)
   { 
     arguments args(argc, argv);
     
-#ifndef NDEBUG
-    std::filesystem::current_path(R"(C:\Users\alex\Desktop\projects\leisure\Cornel\workspace)");    
-#endif
+//#ifndef NDEBUG
+//    std::filesystem::current_path(R"(C:\Users\alex\Desktop\projects\leisure\Cornel\workspace)");    
+//#endif
 
     std::filesystem::path config_path(args.value_or("-C"sv, "config.ini"sv));
     
