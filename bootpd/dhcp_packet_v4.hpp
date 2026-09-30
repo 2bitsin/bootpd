@@ -2,15 +2,19 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <iostream>
-#include <span>
 #include <optional>
+#include <span>
+#include <string_view>
+#include <vector>
 
 #include <common/serdes.hpp>
 
 #include "dhcp_consts_v4.hpp"
 #include "dhcp_options_v4.hpp"
 
+// A BOOTP / DHCP message (RFC 951, RFC 2131).
 struct dhcp_packet_v4
 {
 	using mac_address_type = std::uint8_t[6];	
@@ -26,7 +30,7 @@ struct dhcp_packet_v4
 	auto options()->dhcp_options_v4&;
 	auto options() const->dhcp_options_v4 const&;	
 	auto assign_options(dhcp_options_v4 const& from, std::span<const std::uint8_t> which) -> dhcp_packet_v4&;
-	auto assign_options(dhcp_options_v4 const& from, std::initializer_list<const std::uint8_t> which) -> dhcp_packet_v4&;
+	auto assign_options(dhcp_options_v4 const& from, std::initializer_list<std::uint8_t> which) -> dhcp_packet_v4&;
 	
 	auto requested_parameters() const ->std::span<const std::uint8_t>;
 	auto message_type(std::uint8_t msg_type) -> dhcp_packet_v4&;	
@@ -83,9 +87,9 @@ protected:
 	std::uint32_t		m_your_ip_address_v4 { 0 };
 	std::uint32_t		m_server_ip_address_v4 { 0 };
 	std::uint32_t		m_gateway_ip_address_v4 { 0 };
-	std::uint8_t		m_client_hardware_address [16] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-	char						m_server_host_name [64] { 0 };
-	char						m_boot_file_name [128] { 0 };
+	std::uint8_t		m_client_hardware_address [16] {};
+	char						m_server_host_name [64] {};
+	char						m_boot_file_name [128] {};
 	dhcp_options_v4 m_options;
 };
 

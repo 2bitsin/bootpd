@@ -1,8 +1,28 @@
 #include "tftp_packet.hpp"
 #include "tftp_consts.hpp"
 
+#include <format>
 #include <stdexcept>
 #include <type_traits>
+
+#include <common/utility_case.hpp>
+
+namespace
+{
+	template <typename Serdes>
+	auto read_options(Serdes& _serdes) -> tftp_packet::dictionary_type
+	{
+		tftp_packet::dictionary_type options_v;
+		while (!_serdes.empty())
+		{
+			std::string option, value;
+			_serdes(option, serdes_asciiz);
+			_serdes(value, serdes_asciiz);
+			options_v.insert_or_assign(lowercase(std::move(option)), std::move(value));
+		}
+		return options_v;
+	}
+}
 
 auto tftp_packet::error_code_to_string(error_category_type value) noexcept
 	-> std::string
@@ -57,14 +77,9 @@ auto tftp_packet::serdes(::serdes<serdes_reader>& _serdes)
 			type_rrq payload_v;
 			_serdes(payload_v.filename, serdes_asciiz);
 			_serdes(payload_v.xfermode, serdes_asciiz);
-			while (!_serdes.empty())
-			{
-				std::string option, value;
-				_serdes(option, serdes_asciiz);
-				_serdes(value, serdes_asciiz);
-				payload_v.options.emplace(option, value);
-			}
-			m_value = payload_v;
+			payload_v.xfermode = lowercase(std::move(payload_v.xfermode));
+			payload_v.options = read_options(_serdes);
+			m_value = std::move(payload_v);
 			break;
 		}
 	case TFTP_OPCODE_WRQ:
@@ -72,56 +87,54 @@ auto tftp_packet::serdes(::serdes<serdes_reader>& _serdes)
 			type_wrq payload_v;
 			_serdes(payload_v.filename, serdes_asciiz);
 			_serdes(payload_v.xfermode, serdes_asciiz);
-			while (!_serdes.empty())
-			{
-				std::string option, value;
-				_serdes(option, serdes_asciiz);
-				_serdes(value, serdes_asciiz);
-				payload_v.options.emplace(option, value);
-			}
-			m_value = payload_v;
+			payload_v.xfermode = lowercase(std::move(payload_v.xfermode));
+			payload_v.options = read_options(_serdes);
+			m_value = std::move(payload_v);
 			break;
 		}
 	case TFTP_OPCODE_DATA:
 		{
 			type_data payload_v;
 			_serdes(payload_v.block_id);
-			while (!_serdes.empty()) {
-				std::byte byte_v;
-				_serdes(byte_v);
-				payload_v.data.emplace_back(byte_v);
-			}
-			m_value = payload_v;
+			payload_v.data.resize(_serdes.remaining_bytes());
+			_serdes(std::span{ payload_v.data });
+			m_value = std::move(payload_v);
 			break;
 		}
 	case TFTP_OPCODE_ACK:
 		{
 			type_ack payload_v;
 			_serdes(payload_v.block_id);
-			m_value = payload_v;
+			m_value = std::move(payload_v);
 			break;
 		}
 	case TFTP_OPCODE_ERROR:
 		{
 			type_error payload_v;
 			_serdes(payload_v.error_code);
-			_serdes(payload_v.error_string, serdes_asciiz);
-			m_value = payload_v;
+			// Some clients omit the terminating NUL of the message.
+			std::string message_v;
+			while (!_serdes.empty())
+			{
+				char char_v;
+				_serdes(char_v);
+				if (char_v == '\0')
+					break;
+				message_v.push_back(char_v);
+			}
+			payload_v.error_string = std::move(message_v);
+			m_value = std::move(payload_v);
 			break;
 		}
 	case TFTP_OPCODE_OACK:
 		{
 			type_oack payload_v;
-			while (!_serdes.empty())
-			{
-				std::string option, value;
-				_serdes(option, serdes_asciiz);
-				_serdes(value, serdes_asciiz);
-				payload_v.options.emplace(option, value);
-			}
-			m_value = payload_v;
+			payload_v.options = read_options(_serdes);
+			m_value = std::move(payload_v);
 			break;
 		}
+	default:
+		throw std::runtime_error(std::format("Unknown TFTP opcode {}.", opcode));
 	}
 	return _serdes;
 }
@@ -222,7 +235,9 @@ auto tftp_packet::to_string() const -> std::string
 		}
 		else if constexpr (std::is_same_v<T, type_oack>) {
 			for (auto&& [key, val] : value.options) option_string +=  std::format(", {}=\"{}\"", key, val);
-			return std::format("OACK(options={})"sv, option_string);
+			if (!option_string.empty())
+				option_string.erase(0, 2);
+			return std::format("OACK({})"sv, option_string);
 		}
 		else if constexpr (std::is_same_v<T, std::monostate>) {
 			return "(Nil)"s;			
@@ -233,9 +248,9 @@ auto tftp_packet::to_string() const -> std::string
 	}, m_value);
 }
 
-auto tftp_packet::opcode() const noexcept -> std::uint16_t
+auto tftp_packet::opcode() const -> std::uint16_t
 {
-	return visit([]<typename T>(T const& value) -> std::uint16_t
+	return visit([]<typename T>(T const&) -> std::uint16_t
 	{
 		if constexpr (std::is_same_v<T, type_rrq>)
 			return TFTP_OPCODE_RRQ;
@@ -307,7 +322,7 @@ auto tftp_packet::set_oack(dictionary_type options) -> tftp_packet&
 	return *this;
 }
 
-auto tftp_packet::serdes_size_hint() const noexcept -> std::size_t
+auto tftp_packet::serdes_size_hint() const -> std::size_t
 {
 	return visit([]<typename T>(T const& value) -> std::size_t 
 	{

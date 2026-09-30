@@ -2,10 +2,11 @@
 
 #include <iostream>
 #include <unordered_map>
-#include <any>
 #include <string>
 #include <string_view>
 #include <optional>
+#include <stdexcept>
+#include <vector>
 
 #include "lexical_cast.hpp"
 
@@ -47,21 +48,30 @@ struct config_ini
 		
 	auto operator [](accessor_type index) const -> std::optional<std::string_view>;
 
+	auto has_section(std::string_view section) const -> bool;
 	auto sections() const -> std::vector<std::string_view>;
 	auto keynames(std::string_view section = "") const -> std::vector<std::string_view>;		
 	auto value(accessor_type index) const -> std::optional<std::string_view>;	
 
+	// Returns the value converted to T, std::nullopt if the key is missing.
+	// Throws std::runtime_error if the value exists but can't be converted.
 	template <typename T>
 	auto value_as(accessor_type index) const -> std::optional<T>
 	{
+		const auto optional_value = value (index);
+		if (!optional_value.has_value())
+			return std::nullopt;
 		try
 		{
-			if (const auto optional_value = value (index); optional_value.has_value()) 
-				return lexical_cast<T>(optional_value.value());
+			return lexical_cast<T>(optional_value.value());
 		}
-		catch(bad_lexical_cast const& ex)
-		{}		
-		return std::nullopt; 
+		catch(std::exception const& ex)
+		{
+			std::string key_name (index.keyname);
+			if (!index.section.empty())
+				key_name = "[" + std::string(index.section) + "] " + key_name;
+			throw std::runtime_error("Invalid value for '" + key_name + "' : " + ex.what());
+		}
 	}
 
 	template <typename T>

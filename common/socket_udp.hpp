@@ -1,56 +1,78 @@
-#pragma once 
+#pragma once
 
-#include <span>
 #include <chrono>
-#include <type_traits>
 #include <concepts>
+#include <cstddef>
+#include <optional>
+#include <span>
 #include <utility>
+#include <vector>
 
-#include "socket_api.hpp"
+#include "address_v4.hpp"
+#include "async.hpp"
 #include "serdes.hpp"
+#include "socket_api.hpp"
 
-inline static const constexpr std::uint32_t message_out_of_bounds_flag	= 0x01u;
-inline static const constexpr std::uint32_t message_peek_flag						= 0x02u;
-inline static const constexpr std::uint32_t message_dont_route_flag			= 0x04u;
-inline static const constexpr std::uint32_t message_wait_all_flag				= 0x08u;
+struct datagram
+{
+	address_v4 source;
+	std::vector<std::byte> data;
+};
 
+// A non-blocking UDP socket whose receive operations are awaitable.
 struct socket_udp
 {
+	using time_point = async::io_context::time_point;
+
 	socket_udp();
-	socket_udp(const struct address_v4& addr);
-	socket_udp(socket_udp&& from);
-	socket_udp& operator = (socket_udp && from);
+	explicit socket_udp(address_v4 const& bind_address);
+	socket_udp(socket_udp&& from) noexcept;
+	auto operator = (socket_udp&& from) noexcept -> socket_udp&;
 	socket_udp(const socket_udp&) = delete;
-	socket_udp& operator = (const socket_udp&) = delete;
+	auto operator = (const socket_udp&) -> socket_udp& = delete;
  ~socket_udp();
-  void swap(socket_udp& other);
-	void bind(const struct address_v4& addr);
-	
-	/* buffer will be adjusted to span only the bytes received */
-	auto recv(std::span<std::byte>& buffer, struct address_v4& source, uint32_t flags) const -> std::size_t;
 
-	/* buffer will be adjusted to span only the bytes not sent */
-	auto send(std::span<const std::byte>& buffer, const struct address_v4& target, uint32_t flags) const -> std::size_t;
+	void swap(socket_udp& other) noexcept;
+	void close() noexcept;
 
-	auto recv(uint32_t flags) const -> std::tuple<address_v4, std::vector<std::byte>>;
-	
+	auto is_open() const noexcept -> bool;
+	auto native_handle() const noexcept -> int_socket_type;
+	auto local_address() const -> address_v4;
+
+	// Returns a pending datagram, or std::nullopt if there is none.
+	auto try_recv() const -> std::optional<datagram>;
+
+	// Waits for a datagram. Returns std::nullopt if `deadline` passes first.
+	// Throws async::operation_cancelled when the context is stopped.
+	auto async_recv(async::io_context& context, time_point deadline = time_point::max()) const
+		-> async::task<std::optional<datagram>>;
+
+	template <typename Rep, typename Period>
+	auto async_recv(async::io_context& context, std::chrono::duration<Rep, Period> timeout) const
+		-> async::task<std::optional<datagram>>
+	{
+		const auto duration_v = std::chrono::duration_cast<async::io_context::duration>(timeout);
+		return async_recv(context, async::io_context::clock::now() + duration_v);
+	}
+
+	auto send(std::span<const std::byte> buffer, const address_v4& target) const -> std::size_t;
+
 	template <typename T>
-	requires requires (T const& packet, ::serdes<serdes_writer>& s) 
+	requires requires (T const& packet, ::serdes<serdes_writer>& s)
 	{
 		{ packet.serdes_size_hint() } -> std::convertible_to<std::size_t>;
 		{ packet.serdes(s) } -> std::convertible_to<::serdes<serdes_writer>&>;
 	}
-	auto send(T const& packet, const address_v4& target, uint32_t flags) const -> std::size_t
+	auto send(T const& packet, const address_v4& target) const -> std::size_t
 	{
-		auto buffer_v = serialize_to_vector(packet);
-		std::span<const std::byte> buffer_s { buffer_v };
-		return send(buffer_s, target, flags);
+		const auto buffer_v = serialize_to_vector(packet);
+		return send(std::span<const std::byte>{ buffer_v }, target);
 	}
 
 	template <typename O>
 	auto option(const typename O::value_type& value) const -> void
 	{
-		return socket_option<O>(m_sock, value);
+		socket_option<O>(m_sock, value);
 	}
 
 	template <typename O>
@@ -59,33 +81,6 @@ struct socket_udp
 		return socket_option<O>(m_sock);
 	}
 
-	template <typename... D>
-	void timeout_recv(std::chrono::duration<D...> const& dur)
-	{
-		using namespace std::chrono;
-		const auto to = duration_cast<milliseconds>(dur);
-		option<so_rcvtimeo>((std::uint32_t)to.count());		
-	}
-		
-	template <typename... D>
-	void timeout_send(std::chrono::duration<D...> const& dur)
-	{
-		using namespace std::chrono;
-		const auto to = duration_cast<milliseconds>(dur);
-		option<so_sndtimeo>((std::uint32_t)to.count());		
-	}
-
-	template <typename... D>
-	void timeout(std::chrono::duration<D...> const& dur)
-	{
-		using namespace std::chrono;
-		const auto to = duration_cast<milliseconds>(dur);
-		option<so_rcvtimeo>((std::uint32_t)to.count());
-		option<so_sndtimeo>((std::uint32_t)to.count());		
-	}
-
-protected:
-	socket_udp(int_socket_type int_sock);
 private:
 	int_socket_type m_sock;
 };

@@ -40,7 +40,10 @@ auto arguments::value(std::string_view& _value, std::string_view _key) const -> 
 
 auto arguments::values(std::string_view _key) const -> const std::vector<std::string_view>&
 {
-  return m_values.at(_key);
+  static const std::vector<std::string_view> no_values;
+  if (auto it = m_values.find(_key); it != m_values.end())
+    return it->second;
+  return no_values;
 }
 
 auto arguments::value_or(std::string_view _key, std::string_view _default) const -> std::string_view

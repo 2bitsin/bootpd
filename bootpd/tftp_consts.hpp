@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 static inline constexpr const std::uint16_t TFTP_OPCODE_RRQ = 1;
 static inline constexpr const std::uint16_t TFTP_OPCODE_WRQ = 2;
 static inline constexpr const std::uint16_t TFTP_OPCODE_DATA = 3;

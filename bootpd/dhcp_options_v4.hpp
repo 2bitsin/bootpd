@@ -1,233 +1,209 @@
 #pragma once
 
 #include <array>
-#include <memory>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <optional>
 #include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <tuple>
-#include <algorithm>
+#include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <common/serdes.hpp>
 #include "dhcp_consts_v4.hpp"
 
+// The DHCP options field (RFC 2132): a magic cookie followed by
+// code / length / value triplets, terminated by the END option.
 struct dhcp_options_v4
 {
-	dhcp_options_v4()
-	: m_cookie{ DHCP_MAGIC_COOKIE }, 
-		m_values{} 
-	{}
-	
-	dhcp_options_v4(dhcp_options_v4 const& p)
-	:	dhcp_options_v4()
-	{
-		for (auto i = 0u; i < m_values.size(); ++i)
-		{
-			if (!p.m_values[i])
-				continue;
-			auto size = p.m_values[i][0] + 1u;
-			auto data = std::make_unique<std::uint8_t[]>(size);
-			std::copy(p.m_values[i].get(), p.m_values[i].get() + size, data.get());
-			m_values[i] = std::move(data);
-		}
-	}
+	using value_type = std::vector<std::uint8_t>;
 
-	auto operator = (dhcp_options_v4 const& p) 
-		-> dhcp_options_v4&
-	{
-		this->~dhcp_options_v4();
-		new (this) dhcp_options_v4(p);		
-		return *this;
-	}
-	
-	dhcp_options_v4(dhcp_options_v4&& prev) noexcept
-	:	m_values{ std::move(prev.m_values) }
-	{}
-	
-	auto operator = (dhcp_options_v4&& prev) noexcept -> dhcp_options_v4& 
-	{
-		auto tmp = std::move(prev);
-		std::swap(tmp, *this);
-		return *this;
-	}
+	static constexpr auto is_valid_code(std::uint8_t code) noexcept -> bool
+	{ return code != DHCP_OPTION_PAD && code != DHCP_OPTION_END; }
 
-	void swap(dhcp_options_v4& other) noexcept
-	{
-		std::swap(m_values, other.m_values);
-	}
-
-	auto serdes(::serdes<serdes_reader>& _serdes) 
+	auto serdes(::serdes<serdes_reader>& _serdes)
 		-> ::serdes<serdes_reader>&
 	{
-		using std::make_unique;
-		using std::unique_ptr;
-		using std::uint8_t;
-		using std::span;
+		m_values = {};
+		m_cookie = 0u;
 
-		unique_ptr<uint8_t[]> data;
-		uint8_t code;
-		uint8_t size;
-		
 		if (_serdes.remaining_bytes() < sizeof (m_cookie))
 			return _serdes;
 		_serdes(m_cookie);
 		if (m_cookie != DHCP_MAGIC_COOKIE)
 			return _serdes;
-		
-		while(true)
+
+		// Be lenient with malformed input : a missing END option or a
+		// truncated last option ends parsing instead of rejecting the packet.
+		while (!_serdes.empty())
 		{
+			std::uint8_t code{ 0u };
+			std::uint8_t size{ 0u };
 			_serdes(code);
-			if (code == 0x00u) continue;
-			if (code == 0xffu) break;
+			if (code == DHCP_OPTION_PAD) continue;
+			if (code == DHCP_OPTION_END) break;
+			if (_serdes.empty())
+				break;
 			_serdes(size);
-			data = make_unique<uint8_t[]>(size + 1u);
-			data[0] = size;
-			_serdes(span{ data.get() + 1u, size });
-			m_values[code - 1u] = std::move (data);
-		}		
+			if (_serdes.remaining_bytes() < size)
+				break;
+
+			// Options that appear more than once are concatenated (RFC 3396).
+			auto& value_v = m_values[code];
+			if (!value_v.has_value())
+				value_v.emplace();
+			const auto offset = value_v->size();
+			value_v->resize(offset + size);
+			_serdes(std::span{ value_v->data() + offset, size });
+		}
 		return _serdes;
 	}
 
 	auto serdes(::serdes<serdes_writer>& _serdes) const
 		-> ::serdes<serdes_writer>&
 	{
-		using std::make_unique;
-		using std::unique_ptr;
-		using std::uint8_t;
-		using std::span;
-		
 		_serdes(std::uint32_t(DHCP_MAGIC_COOKIE));
-		const auto count_options = std::min<std::size_t>(std::size(m_values), 254u);
-		for (auto i = 0u; i < count_options; ++i)
+		for (auto code = 1u; code < m_values.size(); ++code)
 		{
-			if (m_values[i] == nullptr)
+			if (!m_values[code].has_value())
 				continue;
-			_serdes(std::uint8_t(i + 1u));
-			_serdes(span{ m_values[i].get(), m_values[i].get()[0] + 1u});
-		}	
-		_serdes(std::uint8_t(0xff));
+			_serdes(std::uint8_t(code));
+			_serdes(std::uint8_t(m_values[code]->size()));
+			_serdes(std::span<const std::uint8_t>{ *m_values[code] });
+		}
+		_serdes(DHCP_OPTION_END);
 		return _serdes;
 	}
-	
-	auto operator[] (std::uint8_t index) const
+
+	auto has(std::uint8_t code) const noexcept -> bool
+	{
+		return is_valid_code(code) && m_values[code].has_value();
+	}
+
+	// Raw option value, empty if the option is not present.
+	auto operator[] (std::uint8_t code) const
 		-> std::span<const std::uint8_t>
 	{
-		using namespace std::string_literals;
-		if (index <= 0x00u || index >= 0xffu)
-			throw std::out_of_range("Accessing invalid option: "s + std::to_string(index));
-		if (m_values [index - 1u] == nullptr) 
+		if (!has(code))
 			return {};
-		const auto option_bytes = m_values [index - 1u].get();
-		return { option_bytes + 1u, option_bytes[0u]};
+		return { *m_values[code] };
+	}
+
+	auto erase(std::uint8_t code) -> dhcp_options_v4&
+	{
+		if (is_valid_code(code))
+			m_values[code].reset();
+		return *this;
 	}
 
 	auto set(std::uint8_t code, std::span<const std::uint8_t> data)
 		-> bool
 	{
-		using std::make_unique;
-		using std::uint8_t;
-		if (code < 1u || code > 254u || data.size() > 255u)
+		if (!is_valid_code(code) || data.size() > 255u)
 			return false;
-		m_values[code - 1u] = make_unique<uint8_t[]>(data.size() + 1u);
-		m_values[code - 1u][0] = (std::uint8_t)data.size();
-		std::copy(data.begin(), data.end(), m_values[code - 1u].get() + 1u);
-	}
-	
-	template <typename... Q>
-	auto set(std::uint8_t code, Q&&... args)
-		-> bool
-	{
-		using std::make_unique;
-		using std::uint8_t;
-
-		static constexpr auto total_size = (sizeof(Q) + ... + 0);
-		if (total_size > 255u)
-			return false;
-		
-		m_values[code - 1u] = make_unique<uint8_t[]>(total_size + 1u);
-		m_values[code - 1u][0] = (uint8_t)total_size;		
-		::serdes<serdes_writer> _serdes (
-			std::span(m_values[code - 1u].get() + 1u, total_size)
-		);
-		((_serdes(std::forward<Q>(args))), ...);
+		m_values[code].emplace(data.begin(), data.end());
 		return true;
 	}
 
-	template <typename... Q>
-	auto value(std::uint8_t code, std::tuple<Q...>& values) const
+	// String valued options (host name, domain name, boot file, ...)
+	auto set(std::uint8_t code, std::string_view text)
 		-> bool
 	{
-		return value(code, values, std::make_index_sequence<sizeof...(Q)>());	
+		return set(code, std::span{ (const std::uint8_t*)text.data(), text.size() });
 	}
 
+	// Fixed size values (addresses, times, ...) stored in network byte order.
+	template <typename... Q>
+	requires (sizeof...(Q) > 0u && ((std::is_arithmetic_v<Q> || std::is_enum_v<Q>) && ...))
+	auto set(std::uint8_t code, Q const&... args)
+		-> bool
+	{
+		static constexpr auto total_size = (sizeof(Q) + ... + 0);
+		if (!is_valid_code(code) || total_size > 255u)
+			return false;
+
+		value_type value_v(total_size);
+		::serdes<serdes_writer> _serdes (std::span{ value_v });
+		((_serdes(args)), ...);
+		m_values[code] = std::move(value_v);
+		return true;
+	}
+
+	// Decodes an option into the referenced values, false if the option is
+	// missing or too short.
 	template <typename... Q>
 	auto value(std::uint8_t code, std::tuple<Q&...> values) const
 		-> bool
 	{
-		return value(code, values, std::make_index_sequence<sizeof...(Q)>());	
+		if (!has(code))
+			return false;
+		try
+		{
+			::serdes<serdes_reader> _serdes(std::span<const std::uint8_t>{ *m_values[code] });
+			std::apply([&_serdes](auto&... value) { ((_serdes(value)), ...); }, values);
+			return true;
+		}
+		catch (std::exception const&)
+		{
+			return false;
+		}
 	}
 
+	// Copies option `code` from another set, if present there.
 	auto assign(std::uint8_t code, dhcp_options_v4 const& from)
+		-> bool
 	{
-		using std::make_unique;
-		if (from.m_values[code - 1u] == nullptr)
+		if (!from.has(code))
 			return false;
-		auto& src_value = from.m_values[code - 1u];
-		auto& dst_value = m_values[code - 1u];
-		dst_value = make_unique<uint8_t[]>(src_value[0] + 1u);
-		std::copy(src_value.get(), src_value.get() + src_value[0] + 1u, dst_value.get());
+		m_values[code] = from.m_values[code];
 		return true;
 	}
-	
-	auto message_type() const 
+
+	auto message_type() const
 		-> std::optional<std::uint8_t>
 	{
 		std::uint8_t mt_val = 0u;
-		if (value(0x35, std::tie(mt_val)))
+		if (value(DHCP_OPTION_MESSAGE_TYPE, std::tie(mt_val)))
 			return mt_val;
 		return std::nullopt;
 	}
-	
-	auto message_type(std::uint8_t msg_type)
+
+	auto message_type(std::uint8_t msg_type) -> void
 	{
-		set(0x35, msg_type);
+		set(DHCP_OPTION_MESSAGE_TYPE, msg_type);
 	}
 
-	auto requested_parameters() const 
+	auto requested_parameters() const
 		-> std::span<const std::uint8_t>
 	{
-		return (*this)[0x37];
+		return (*this)[DHCP_OPTION_PARAMETER_REQUEST_LIST];
 	}
 
-	auto serdes_size_hint() const 
+	// True if the options area started with the RFC 1048 magic cookie.
+	auto has_cookie() const noexcept -> bool
+	{
+		return m_cookie == DHCP_MAGIC_COOKIE;
+	}
+
+	auto serdes_size_hint() const
 		-> std::size_t
 	{
-		std::size_t total_sum = sizeof(std::uint8_t) + sizeof(m_cookie);
+		std::size_t total_sum = sizeof(m_cookie) + sizeof(std::uint8_t);
 		for(auto&& value : m_values)
 		{
-			if (value == nullptr)
-				continue;
-			total_sum += (value[0] + 2*sizeof(std::uint8_t));
+			if (value.has_value())
+				total_sum += value->size() + 2u * sizeof(std::uint8_t);
 		}
 		return total_sum;
 	}
-	
-protected:
-	template <typename Tuple, std::size_t ... Index>
-	auto value(std::uint8_t code, Tuple& values, std::index_sequence<Index...>) const
-		-> bool
-	{
-		if (code < 1u || code > 254u || !m_values[code - 1u])
-			return false;
-		
-		::serdes<serdes_reader> _serdes(
-			std::span(m_values[code - 1u].get() + 1u, m_values[code - 1u][0])
-		);
-
-		((_serdes(std::get<Index>(values))),...);
-		return true;
-	}
 
 private:
-	std::uint32_t m_cookie;
-	std::array<std::unique_ptr<std::uint8_t[]>, 254u> m_values;
+	std::uint32_t m_cookie{ DHCP_MAGIC_COOKIE };
+	// Indexed by option code, 0 (PAD) and 255 (END) are never used.
+	std::array<std::optional<value_type>, 255u> m_values{};
 };

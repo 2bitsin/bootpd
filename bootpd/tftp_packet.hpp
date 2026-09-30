@@ -1,13 +1,16 @@
 #pragma once
 
-#include <variant>
-#include <unordered_map>
-#include <format>
+#include <cstdint>
+#include <map>
+#include <span>
 #include <string>
 #include <string_view>
+#include <variant>
+#include <vector>
 
 #include <common/serdes.hpp>
 
+// A TFTP packet (RFC 1350) including option negotiation (RFC 2347).
 struct tftp_packet
 {
 	enum error_category_type : std::uint16_t
@@ -19,12 +22,14 @@ struct tftp_packet
 		illegal_operation,
 		unknown_transfer_id,
 		file_already_exists,
-		no_such_user		
+		no_such_user,
+		option_negotiation_failed
 	};
 
 	static auto error_code_to_string(error_category_type value) noexcept -> std::string; 
 
-	using dictionary_type = std::unordered_map<std::string, std::string>;
+	// Option names are case insensitive, they are stored in lower case.
+	using dictionary_type = std::map<std::string, std::string>;
 
 	struct type_rrq
 	{
@@ -63,6 +68,7 @@ struct tftp_packet
 	using payload_type = std::variant<std::monostate, type_rrq, type_wrq, type_data, type_ack, type_error, type_oack>;
 
 	tftp_packet();
+	// These throw std::runtime_error on malformed input.
 	tftp_packet(::serdes<serdes_reader>& _serdes);
 	tftp_packet(std::span<const std::byte> bits);
 	tftp_packet(std::vector<std::byte> const& bits);
@@ -80,7 +86,7 @@ struct tftp_packet
 	auto visit(Func&& func)
 	{ return std::visit(std::forward<Func>(func), m_value); }
 
-	auto opcode() const noexcept -> std::uint16_t;
+	auto opcode() const -> std::uint16_t;
 
 	auto clear() -> tftp_packet&;
 	auto set_rrq(std::string_view filename, std::string_view xfermode, dictionary_type options) -> tftp_packet&;
@@ -88,7 +94,7 @@ struct tftp_packet
 	auto set_data(std::uint16_t block_id, std::span<const std::byte> data) -> tftp_packet&;
 	auto set_ack(std::uint16_t block_id) -> tftp_packet&;
 	auto set_error(error_category_type error_code, std::string_view error_string) -> tftp_packet&;
-  auto set_error(error_category_type error_code) -> tftp_packet&;
+	auto set_error(error_category_type error_code) -> tftp_packet&;
 	auto set_oack(dictionary_type options) -> tftp_packet&;
 
 	static auto make_rrq(std::string_view filename, std::string_view xfermode, dictionary_type options)->tftp_packet;
@@ -99,7 +105,7 @@ struct tftp_packet
 	static auto make_error(error_category_type error_code)->tftp_packet;
 	static auto make_oack(dictionary_type options)->tftp_packet;
 
-	auto serdes_size_hint() const noexcept -> std::size_t;	
+	auto serdes_size_hint() const -> std::size_t;
 
 	template <typename T>
 	auto is() const -> bool

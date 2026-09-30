@@ -1,396 +1,377 @@
+#include <algorithm>
+#include <cstring>
+#include <format>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <mutex>
 #include <system_error>
-#include <iostream>
-#include <system_error>
-#include <charconv>
+#include <vector>
 
-#include <common/byte_order.hpp>
+#ifdef _WIN32
+	#ifndef WIN32_LEAN_AND_MEAN
+		#define WIN32_LEAN_AND_MEAN
+	#endif
+	#ifndef NOMINMAX
+		#define NOMINMAX
+	#endif
+	#include <winsock2.h>
+	#include <ws2tcpip.h>
+	#include <mswsock.h>
+	#include <mstcpip.h>
+	#include <windows.h>
+	#ifdef _MSC_VER
+		#pragma comment(lib, "ws2_32.lib")
+	#endif
+	#ifndef SIO_UDP_CONNRESET
+		#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+	#endif
+#else
+	#include <arpa/inet.h>
+	#include <cerrno>
+	#include <fcntl.h>
+	#include <netdb.h>
+	#include <netinet/in.h>
+	#include <poll.h>
+	#include <sys/socket.h>
+	#include <unistd.h>
+#endif
 
+#include "byte_order.hpp"
 #include "socket_api.hpp"
 #include "address_v4.hpp"
-#include "socket_error.hpp"
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-
-#include <ws2tcpip.h>
-#include <WinSock2.h>
-#include <Windows.h>
-
-#pragma comment(lib, "ws2_32.lib")
-
-
-static auto socket_last_error() -> std::int32_t
+namespace
 {
-  return WSAGetLastError();
-}
+#ifdef _WIN32
+	using native_socket = SOCKET;
+	using socklen_type = int;
+	constexpr int error_would_block = WSAEWOULDBLOCK;
+	constexpr int error_interrupted = WSAEINTR;
+	constexpr int error_conn_reset = WSAECONNRESET;
+	constexpr int error_msg_size = WSAEMSGSIZE;
 
-static auto is_time_out_error(std::int32_t error)
-{
-  return WSAETIMEDOUT == error;
-}
+	auto socket_last_error() -> int { return WSAGetLastError(); }
+#else
+	using native_socket = int;
+	using socklen_type = socklen_t;
+	constexpr int error_would_block = EWOULDBLOCK;
+	constexpr int error_interrupted = EINTR;
+	constexpr int error_conn_reset = ECONNREFUSED;
+	constexpr int error_msg_size = EMSGSIZE;
 
-static auto last_error_as_string(std::int32_t last_error = socket_last_error()) -> std::string
-{
-  using namespace std::string_literals; 
-  switch(last_error)
-  {
-  case WSAEINTR                         : return "WSAEINTR"s                    ;
-  case WSAEBADF                         : return "WSAEBADF"s                    ;      
-  case WSAEACCES                        : return "WSAEACCES"s                   ;      
-  case WSAEFAULT                        : return "WSAEFAULT"s                   ;      
-  case WSAEINVAL                        : return "WSAEINVAL"s                   ;      
-  case WSAEMFILE                        : return "WSAEMFILE"s                   ;      
-  case WSAEWOULDBLOCK                   : return "WSAEWOULDBLOCK"s              ;
-  case WSAEINPROGRESS                   : return "WSAEINPROGRESS"s              ;      
-  case WSAEALREADY                      : return "WSAEALREADY"s                 ;      
-  case WSAENOTSOCK                      : return "WSAENOTSOCK"s                 ;      
-  case WSAEDESTADDRREQ                  : return "WSAEDESTADDRREQ"s             ;      
-  case WSAEMSGSIZE                      : return "WSAEMSGSIZE"s                 ;      
-  case WSAEPROTOTYPE                    : return "WSAEPROTOTYPE"s               ;      
-  case WSAENOPROTOOPT                   : return "WSAENOPROTOOPT"s              ;      
-  case WSAEPROTONOSUPPORT               : return "WSAEPROTONOSUPPORT"s          ;      
-  case WSAESOCKTNOSUPPORT               : return "WSAESOCKTNOSUPPORT"s          ;      
-  case WSAEOPNOTSUPP                    : return "WSAEOPNOTSUPP"s               ;      
-  case WSAEPFNOSUPPORT                  : return "WSAEPFNOSUPPORT"s             ;      
-  case WSAEAFNOSUPPORT                  : return "WSAEAFNOSUPPORT"s             ;      
-  case WSAEADDRINUSE                    : return "WSAEADDRINUSE"s               ;      
-  case WSAEADDRNOTAVAIL                 : return "WSAEADDRNOTAVAIL"s            ;      
-  case WSAENETDOWN                      : return "WSAENETDOWN"s                 ;      
-  case WSAENETUNREACH                   : return "WSAENETUNREACH"s              ;      
-  case WSAENETRESET                     : return "WSAENETRESET"s                ;      
-  case WSAECONNABORTED                  : return "WSAECONNABORTED"s             ;      
-  case WSAECONNRESET                    : return "WSAECONNRESET"s               ;      
-  case WSAENOBUFS                       : return "WSAENOBUFS"s                  ;      
-  case WSAEISCONN                       : return "WSAEISCONN"s                  ;      
-  case WSAENOTCONN                      : return "WSAENOTCONN"s                 ;      
-  case WSAESHUTDOWN                     : return "WSAESHUTDOWN"s                ;      
-  case WSAETOOMANYREFS                  : return "WSAETOOMANYREFS"s             ;      
-  case WSAETIMEDOUT                     : return "WSAETIMEDOUT"s                ;      
-  case WSAECONNREFUSED                  : return "WSAECONNREFUSED"s             ;      
-  case WSAELOOP                         : return "WSAELOOP"s                    ;      
-  case WSAENAMETOOLONG                  : return "WSAENAMETOOLONG"s             ;      
-  case WSAEHOSTDOWN                     : return "WSAEHOSTDOWN"s                ;      
-  case WSAEHOSTUNREACH                  : return "WSAEHOSTUNREACH"s             ;      
-  case WSAENOTEMPTY                     : return "WSAENOTEMPTY"s                ;      
-  case WSAEPROCLIM                      : return "WSAEPROCLIM"s                 ;      
-  case WSAEUSERS                        : return "WSAEUSERS"s                   ;      
-  case WSAEDQUOT                        : return "WSAEDQUOT"s                   ;      
-  case WSAESTALE                        : return "WSAESTALE"s                   ;      
-  case WSAEREMOTE                       : return "WSAEREMOTE"s                  ;      
-  case WSASYSNOTREADY                   : return "WSASYSNOTREADY"s              ;      
-  case WSAVERNOTSUPPORTED               : return "WSAVERNOTSUPPORTED"s          ;      
-  case WSANOTINITIALISED                : return "WSANOTINITIALISED"s           ;      
-  case WSAEDISCON                       : return "WSAEDISCON"s                  ;      
-  case WSAENOMORE                       : return "WSAENOMORE"s                  ;      
-  case WSAECANCELLED                    : return "WSAECANCELLED"s               ;      
-  case WSAEINVALIDPROCTABLE             : return "WSAEINVALIDPROCTABLE"s        ;      
-  case WSAEINVALIDPROVIDER              : return "WSAEINVALIDPROVIDER"s         ;      
-  case WSAEPROVIDERFAILEDINIT           : return "WSAEPROVIDERFAILEDINIT"s      ;      
-  case WSASYSCALLFAILURE                : return "WSASYSCALLFAILURE"s           ;      
-  case WSASERVICE_NOT_FOUND             : return "WSASERVICE_NOT_FOUND"s        ;      
-  case WSATYPE_NOT_FOUND                : return "WSATYPE_NOT_FOUND"s           ;      
-  case WSA_E_NO_MORE                    : return "WSA_E_NO_MORE"s               ;      
-  case WSA_E_CANCELLED                  : return "WSA_E_CANCELLED"s             ;      
-  case WSAEREFUSED                      : return "WSAEREFUSED"s                 ;      
-  case WSAHOST_NOT_FOUND                : return "WSAHOST_NOT_FOUND"s           ;      
-  case WSATRY_AGAIN                     : return "WSATRY_AGAIN"s                ;      
-  case WSANO_RECOVERY                   : return "WSANO_RECOVERY"s              ;      
-  case WSANO_DATA                       : return "WSANO_DATA"s                  ;      
-  case WSA_QOS_RECEIVERS                : return "WSA_QOS_RECEIVERS"s           ;      
-  case WSA_QOS_SENDERS                  : return "WSA_QOS_SENDERS"s             ;      
-  case WSA_QOS_NO_SENDERS               : return "WSA_QOS_NO_SENDERS"s          ;      
-  case WSA_QOS_NO_RECEIVERS             : return "WSA_QOS_NO_RECEIVERS"s        ;      
-  case WSA_QOS_REQUEST_CONFIRMED        : return "WSA_QOS_REQUEST_CONFIRMED"s   ;      
-  case WSA_QOS_ADMISSION_FAILURE        : return "WSA_QOS_ADMISSION_FAILURE"s   ;      
-  case WSA_QOS_POLICY_FAILURE           : return "WSA_QOS_POLICY_FAILURE"s      ;      
-  case WSA_QOS_BAD_STYLE                : return "WSA_QOS_BAD_STYLE"s           ;      
-  case WSA_QOS_BAD_OBJECT               : return "WSA_QOS_BAD_OBJECT"s          ;      
-  case WSA_QOS_TRAFFIC_CTRL_ERROR       : return "WSA_QOS_TRAFFIC_CTRL_ERROR"s  ;      
-  case WSA_QOS_GENERIC_ERROR            : return "WSA_QOS_GENERIC_ERROR"s       ;      
-  case WSA_QOS_ESERVICETYPE             : return "WSA_QOS_ESERVICETYPE"s        ;      
-  case WSA_QOS_EFLOWSPEC                : return "WSA_QOS_EFLOWSPEC"s           ;      
-  case WSA_QOS_EPROVSPECBUF             : return "WSA_QOS_EPROVSPECBUF"s        ;      
-  case WSA_QOS_EFILTERSTYLE             : return "WSA_QOS_EFILTERSTYLE"s        ;      
-  case WSA_QOS_EFILTERTYPE              : return "WSA_QOS_EFILTERTYPE"s         ;      
-  case WSA_QOS_EFILTERCOUNT             : return "WSA_QOS_EFILTERCOUNT"s        ;      
-  case WSA_QOS_EOBJLENGTH               : return "WSA_QOS_EOBJLENGTH"s          ;      
-  case WSA_QOS_EFLOWCOUNT               : return "WSA_QOS_EFLOWCOUNT"s          ;      
-  case WSA_QOS_EUNKOWNPSOBJ             : return "WSA_QOS_EUNKOWNPSOBJ"s        ;      
-  case WSA_QOS_EPOLICYOBJ               : return "WSA_QOS_EPOLICYOBJ"s          ;      
-  case WSA_QOS_EFLOWDESC                : return "WSA_QOS_EFLOWDESC"s           ;      
-  case WSA_QOS_EPSFLOWSPEC              : return "WSA_QOS_EPSFLOWSPEC"s         ;      
-  case WSA_QOS_EPSFILTERSPEC            : return "WSA_QOS_EPSFILTERSPEC"s       ;      
-  case WSA_QOS_ESDMODEOBJ               : return "WSA_QOS_ESDMODEOBJ"s          ;      
-  case WSA_QOS_ESHAPERATEOBJ            : return "WSA_QOS_ESHAPERATEOBJ"s       ;      
-  case WSA_QOS_RESERVED_PETYPE          : return "WSA_QOS_RESERVED_PETYPE"s     ;      
-  case WSA_SECURE_HOST_NOT_FOUND        : return "WSA_SECURE_HOST_NOT_FOUND"s   ;      
-  case WSA_IPSEC_NAME_POLICY_ERROR      : return "WSA_IPSEC_NAME_POLICY_ERROR"s ;
-  default: break;
-  }
-  return "#"s + std::to_string(last_error);
-}
+	auto socket_last_error() -> int { return errno; }
+#endif
 
+	auto is_would_block(int error) -> bool
+	{
+#ifndef _WIN32
+		if (error == EAGAIN)
+			return true;
+#endif
+		return error == error_would_block;
+	}
 
-static void v4_initialize()
-{
-  static std::once_flag _;
-  static WSADATA wsad;
-  std::call_once(_, []() 
-  {
-    using namespace std::string_literals;
-    RtlSecureZeroMemory(&wsad, sizeof(wsad));
-    if (auto wsaerr = WSAStartup(MAKEWORD(2, 2), &wsad); wsaerr != 0)
-      throw std::runtime_error("WSAStartup failed with code : "s + last_error_as_string());
-    std::atexit([]() 
-    {
-      if (auto wsaerr = WSACleanup(); wsaerr != 0) {
-        std::cerr << ("WARNING! WSACleanup failed with code : "s + last_error_as_string() + "\n"s);
-      }
-    });
-  });
+	auto last_error_as_string(int error = socket_last_error()) -> std::string
+	{
+		return std::format("{} ({})", std::system_category().message(error), error);
+	}
+
+	auto native(int_socket_type socket) -> native_socket
+	{
+		return static_cast<native_socket>(socket);
+	}
+
+	void v4_initialize()
+	{
+#ifdef _WIN32
+		static std::once_flag once;
+		std::call_once(once, []()
+		{
+			WSADATA wsad{};
+			if (auto wsaerr = WSAStartup(MAKEWORD(2, 2), &wsad); wsaerr != 0)
+				throw std::runtime_error("WSAStartup failed : " + last_error_as_string(wsaerr));
+			std::atexit([]() { WSACleanup(); });
+		});
+#endif
+	}
+
+	auto to_sockaddr(address_v4 const& address) -> sockaddr_in
+	{
+		sockaddr_in target;
+		std::memset(&target, 0, sizeof(target));
+		target.sin_family = AF_INET;
+		target.sin_port = address.net_port();
+		target.sin_addr.s_addr = address.net_addr();
+		return target;
+	}
+
+	auto from_sockaddr(sockaddr_in const& what) -> address_v4
+	{
+		if (what.sin_family != AF_INET)
+			throw std::logic_error("address family mismatch.");
+		return address_v4(net_to_host<std::uint32_t>(what.sin_addr.s_addr), net_to_host<std::uint16_t>(what.sin_port));
+	}
 }
 
 auto v4_resolve_single(std::string_view target) -> std::uint32_t
 {
-  using namespace std::string_literals;
-  std::string tmp{ target };
+	v4_initialize();
 
-  v4_initialize();
-  
-  auto host_e = gethostbyname(tmp.c_str());
-  if (!host_e || !host_e->h_addr_list[0])
-    throw std::runtime_error(tmp + " cannot be resolved, error : "s + last_error_as_string());
-  if (host_e->h_addrtype != AF_INET)
-    throw std::runtime_error(tmp + " cannot be resolved to a v4 address."s);
-  return net_to_host(*(const uint32_t*)host_e->h_addr_list[0]);
-}
-
-
-auto v4_socket_make_udp() -> int_socket_type
-{
-  using namespace std::string_literals;
-
-  v4_initialize ();
-
-
-  if (auto int_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP); int_sock != INVALID_SOCKET)
-  {
-    return int_sock;  
-  }
-  throw std::runtime_error("can't create socket, error code : "s + 
-                           last_error_as_string());   
-}
-
-auto v4_socket_make_udp(const address_v4& address) -> int_socket_type
-{
-  const auto int_sock = v4_socket_make_udp();
-  v4_socket_bind(int_sock, address);
-  return int_sock;
+	std::string host_v{ target };
+	addrinfo hints{};
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_DGRAM;
+	addrinfo* result = nullptr;
+	if (const auto error = getaddrinfo(host_v.c_str(), nullptr, &hints, &result); error != 0 || result == nullptr)
+		throw std::runtime_error(std::format("'{}' cannot be resolved to an IPv4 address.", host_v));
+	const auto address = reinterpret_cast<const sockaddr_in*>(result->ai_addr)->sin_addr.s_addr;
+	freeaddrinfo(result);
+	return net_to_host<std::uint32_t>(address);
 }
 
 auto v4_socket_make_invalid() -> int_socket_type
 {
-  return INVALID_SOCKET;
+#ifdef _WIN32
+	return static_cast<int_socket_type>(INVALID_SOCKET);
+#else
+	return -1;
+#endif
+}
+
+auto v4_socket_make_udp() -> int_socket_type
+{
+	v4_initialize();
+
+	const auto int_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (static_cast<int_socket_type>(int_sock) == v4_socket_make_invalid())
+		throw std::runtime_error("can't create socket : " + last_error_as_string());
+
+#ifdef _WIN32
+	// Without this, an ICMP "port unreachable" caused by an earlier sendto()
+	// makes the next recvfrom() fail with WSAECONNRESET.
+	BOOL new_behavior = FALSE;
+	DWORD bytes_returned = 0;
+	WSAIoctl(int_sock, SIO_UDP_CONNRESET, &new_behavior, sizeof(new_behavior), nullptr, 0, &bytes_returned, nullptr, nullptr);
+#endif
+
+	return static_cast<int_socket_type>(int_sock);
+}
+
+auto v4_socket_make_udp(const address_v4& address) -> int_socket_type
+{
+	const auto int_sock = v4_socket_make_udp();
+	try
+	{
+		v4_socket_set_nonblocking(int_sock);
+		v4_socket_bind(int_sock, address);
+	}
+	catch (...)
+	{
+		v4_socket_close(int_sock);
+		throw;
+	}
+	return int_sock;
+}
+
+void v4_socket_set_nonblocking(int_socket_type socket)
+{
+#ifdef _WIN32
+	u_long mode = 1;
+	if (ioctlsocket(native(socket), FIONBIO, &mode) != 0)
+		throw std::runtime_error("failed to make socket non-blocking : " + last_error_as_string());
+#else
+	const auto flags = fcntl(native(socket), F_GETFL, 0);
+	if (flags < 0 || fcntl(native(socket), F_SETFL, flags | O_NONBLOCK) < 0)
+		throw std::runtime_error("failed to make socket non-blocking : " + last_error_as_string());
+#endif
 }
 
 void v4_socket_bind(int_socket_type socket, const address_v4& address)
-{ 
-  using namespace std::string_literals;
-
-  v4_initialize();
-
-  const auto sai = address.as<sockaddr_in>();
-  if (const auto error = bind(socket, (const sockaddr*)&sai, sizeof(sai)); error != 0)
-    throw std::runtime_error(std::format("failed to bind socket with address '{}', error code : {}", address.to_string(), last_error_as_string()));
-}
-
-void v4_init_sockaddr(sockaddr_in& target, std::size_t len, const struct address_v4& source)
 {
-  RtlSecureZeroMemory(&target, len);
-  target.sin_family = AF_INET;
-  target.sin_port = source.net_port();
-  target.sin_addr.S_un.S_addr = source.net_addr();
+	v4_initialize();
+
+	const auto sai = to_sockaddr(address);
+	if (const auto error = bind(native(socket), (const sockaddr*)&sai, sizeof(sai)); error != 0)
+		throw std::runtime_error(std::format("failed to bind socket to '{}' : {}", address.to_string(), last_error_as_string()));
 }
 
-void v4_init_sockaddr(sockaddr& target, std::size_t len, const struct address_v4& source)
+auto v4_socket_local_address(int_socket_type socket) -> address_v4
 {
-  if(len < sizeof(sockaddr_in))
-    throw std::logic_error("`target` is too small.");
-  v4_init_sockaddr(*reinterpret_cast<sockaddr_in*>(&target), len, source);
+	sockaddr_in sai{};
+	socklen_type len = sizeof(sai);
+	if (getsockname(native(socket), (sockaddr*)&sai, &len) != 0)
+		throw std::runtime_error("getsockname failed : " + last_error_as_string());
+	return from_sockaddr(sai);
 }
 
-auto v4_parse_address_and_port(std::string_view what) -> std::pair<uint32_t, uint16_t>
-{ 
-  using namespace std::string_literals;
-  uint32_t port{ 0 };
-  in_addr address;
-  std::string tmp;
-    
-  v4_initialize();
-  
-  if (auto it = what.find(':'); it != what.npos) {
-    tmp = what.substr(it + 1);
-    if (tmp.size() > 0)
-    {
-      std::size_t idx;
-      port = std::stoul(tmp, &idx, 10);
-      if (idx != tmp.size() || port > 65535)
-        throw std::logic_error(tmp + " is not a valid port number.");
-      port &= 0xffff;
-    }
-    what = what.substr(0, it);
-  }   
-  tmp = what;
-  if (!inet_pton(AF_INET, tmp.c_str(), &address)) {
-    return { v4_resolve_single(tmp), port };
-  }
-  return { net_to_host(address.S_un.S_addr), port };
-}
-
-auto v4_parse_address_and_port(sockaddr_in const& what) -> std::pair<uint32_t, uint16_t>
+auto v4_parse_address_and_port(std::string_view what) -> std::pair<std::uint32_t, std::uint16_t>
 {
-  if (what.sin_family != AF_INET)
-    throw std::logic_error("address family mismatch.");
-  return std::pair {
-    net_to_host(what.sin_addr.S_un.S_addr),
-    net_to_host(what.sin_port)
-  };
+	v4_initialize();
+
+	std::uint16_t port{ 0 };
+	if (auto it = what.find(':'); it != what.npos) {
+		const std::string port_s{ what.substr(it + 1) };
+		if (!port_s.empty())
+		{
+			std::size_t idx = 0;
+			unsigned long value = 0;
+			try { value = std::stoul(port_s, &idx, 10); }
+			catch (std::exception const&) { idx = 0; }
+			if (idx != port_s.size() || value > 65535u)
+				throw std::invalid_argument(port_s + " is not a valid port number.");
+			port = static_cast<std::uint16_t>(value);
+		}
+		what = what.substr(0, it);
+	}
+
+	const std::string address_s{ what };
+	in_addr address{};
+	if (inet_pton(AF_INET, address_s.c_str(), &address) != 1)
+		return { v4_resolve_single(address_s), port };
+	return { net_to_host<std::uint32_t>(address.s_addr), port };
 }
 
 auto v4_address_to_string(std::uint32_t address) -> std::string
 {
-  using namespace std::string_literals;
-  char buff [2048];
-  in_addr addr_bits;  
-
-  v4_initialize();
-  
-  std::memset(buff, 0, sizeof(buff));
-  addr_bits.S_un.S_addr = host_to_net(address);
-  if (!inet_ntop(AF_INET, &addr_bits, buff, sizeof(buff)))
-    throw std::runtime_error("unable to convert address to string, error code : "s + 
-                             last_error_as_string());
-  std::string tmp;
-  tmp.assign(buff);
-  return tmp;
+	return std::format("{}.{}.{}.{}", (address >> 24) & 0xffu, (address >> 16) & 0xffu, (address >> 8) & 0xffu, address & 0xffu);
 }
 
-auto v4_parse_address(std::string_view what) -> uint32_t
+auto v4_parse_address(std::string_view what) -> std::uint32_t
 {
-  auto[address, port] = v4_parse_address_and_port(what);
-  return address;
+	return v4_parse_address_and_port(what).first;
 }
 
-auto v4_socket_close(int_socket_type socket) -> void
+void v4_socket_close(int_socket_type socket)
 {
-  using namespace std::string_literals;
-
-  v4_initialize();
-
-  if (const auto error = closesocket(socket); error != 0)
-  {
-    std::cerr << ("WARNING! failed to close socket, error code : "s + last_error_as_string() + "\n"s);
-  }
+#ifdef _WIN32
+	closesocket(native(socket));
+#else
+	close(native(socket));
+#endif
 }
 
-
-
-auto v4_socket_recv(int_socket_type socket, std::span<std::byte>& buffer, address_v4& address, std::uint32_t flags) -> std::size_t
+auto v4_socket_recv(int_socket_type socket, std::span<std::byte>& buffer, address_v4& address) -> bool
 {
-  using namespace std::string_literals;
+	for (;;)
+	{
+		sockaddr_in addr_in{};
+		socklen_type addr_len = sizeof(addr_in);
+		const auto size = (int)std::min<std::size_t>(buffer.size(), 0x7fffffffu);
 
-  sockaddr_in addr_in;
-  int addr_len{ sizeof(addr_in) };
-  const auto size = std::min((int)buffer.size(), 0x7fffffff);
-  auto* const data = (char*)buffer.data(); 
+		const auto received_bytes = recvfrom(native(socket), (char*)buffer.data(), size, 0, (sockaddr*)&addr_in, &addr_len);
+		if (received_bytes >= 0)
+		{
+			address = from_sockaddr(addr_in);
+			buffer = buffer.subspan(0, (std::size_t)received_bytes);
+			return true;
+		}
 
-  v4_initialize();
+		const auto error_code = socket_last_error();
+		if (is_would_block(error_code))
+			return false;
+		// Interrupted calls, ICMP errors from earlier sends and oversized
+		// datagrams only affect a single packet, carry on with the next one.
+		if (error_code == error_interrupted || error_code == error_conn_reset || error_code == error_msg_size)
+			continue;
 
-  auto received_bytes = recvfrom(socket, data, size, (int)flags, (sockaddr*)&addr_in, &addr_len);
-  if (received_bytes >= 0) 
-  {
-    if (addr_len != sizeof (addr_in))
-      throw std::runtime_error("packet sender address size mismatch."s);
-    address.assign_from(addr_in);
-    buffer = buffer.subspan(0, (unsigned)received_bytes);
-    return received_bytes;
-  }
-
-  if (const auto error_code = socket_last_error(); is_time_out_error(error_code))
-    throw  error_socket_timed_out{ "receive operation timed out." };
-
-  throw std::runtime_error("failed to receive bytes from socket, error code : "s + 
-                           last_error_as_string());
+		throw std::runtime_error("failed to receive from socket : " + last_error_as_string(error_code));
+	}
 }
 
-auto v4_socket_send(int_socket_type socket, std::span<const std::byte>& buffer, const address_v4& address, std::uint32_t flags) -> std::size_t
+auto v4_socket_send(int_socket_type socket, std::span<const std::byte> buffer, const address_v4& address) -> std::size_t
 {
-  using namespace std::string_literals;
-  const auto size = std::min((int)buffer.size(), 0x7fffffff);
-  auto* const data = (char*)buffer.data(); 
-  const auto addr_in = address.as<sockaddr_in>();
+	const auto addr_in = to_sockaddr(address);
+	const auto size = (int)std::min<std::size_t>(buffer.size(), 0x7fffffffu);
 
-  v4_initialize();
+	for (;;)
+	{
+		const auto sent_bytes = sendto(native(socket), (const char*)buffer.data(), size, 0, (const sockaddr*)&addr_in, sizeof(addr_in));
+		if (sent_bytes >= 0)
+			return (std::size_t)sent_bytes;
 
-  auto sent_bytes = sendto(socket, data, size, (int)flags, (const sockaddr*)&addr_in, sizeof(addr_in));
-  if (sent_bytes >= 0)
-  {
-    buffer = buffer.subspan(sent_bytes);
-    return sent_bytes;
-  }
+		const auto error_code = socket_last_error();
+		if (error_code == error_interrupted)
+			continue;
+		// UDP is lossy anyway, a full send buffer is equivalent to a dropped packet.
+		if (is_would_block(error_code))
+			return 0u;
+		throw std::runtime_error(std::format("failed to send to '{}' : {}", address.to_string(), last_error_as_string(error_code)));
+	}
+}
 
-  if (const auto error_code = socket_last_error(); is_time_out_error(error_code))
-    throw error_socket_timed_out("send operation timed out.");
+void v4_socket_poll(std::span<socket_poll_entry> entries, int timeout_ms)
+{
+	std::vector<pollfd> fds(entries.size());
+	for (std::size_t i = 0; i < entries.size(); ++i)
+	{
+		fds[i].fd = native(entries[i].socket);
+		fds[i].events = POLLIN;
+		fds[i].revents = 0;
+		entries[i].readable = false;
+	}
 
-  throw std::runtime_error("failed to send bytes trough socket, error code : "s + 
-                           last_error_as_string());
+#ifdef _WIN32
+	if (fds.empty()) {
+		Sleep((DWORD)timeout_ms);
+		return;
+	}
+	const auto result = WSAPoll(fds.data(), (ULONG)fds.size(), timeout_ms);
+#else
+	const auto result = poll(fds.data(), (nfds_t)fds.size(), timeout_ms);
+#endif
+
+	if (result < 0)
+	{
+		const auto error_code = socket_last_error();
+		if (error_code == error_interrupted)
+			return;
+		throw std::runtime_error("poll failed : " + last_error_as_string(error_code));
+	}
+
+	for (std::size_t i = 0; i < entries.size(); ++i)
+	{
+		// Errors are reported as readable, the following recv surfaces them.
+		entries[i].readable = (fds[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0;
+	}
 }
 
 static auto to_hex(std::uint8_t value) -> std::string
 {
-  static constexpr const char x [] = "0123456789ABCDEF";
-  return std::string{ x[(value >> 4) & 0xf], x[value & 0xf] };
+	static constexpr const char x [] = "0123456789ABCDEF";
+	return std::string{ x[(value >> 4) & 0xf], x[value & 0xf] };
 }
 
 auto mac_address_to_string(std::span<const std::uint8_t> data)
-  -> std::string
+	-> std::string
 {
-  using namespace std::string_literals;
-  if (data.size () < 1u)
-    throw std::runtime_error("address is empty"s);
-  
-  std::string value;  
-  value.append(to_hex(data.front()));
-  for (auto&& a_byte : data.subspan(1u))
-  {
-    value.push_back('-');
-    value.append(to_hex(a_byte));
-  }
-  return value;
+	if (data.empty())
+		throw std::runtime_error("hardware address is empty");
+
+	std::string value;
+	value.append(to_hex(data.front()));
+	for (auto&& a_byte : data.subspan(1u))
+	{
+		value.push_back('-');
+		value.append(to_hex(a_byte));
+	}
+	return value;
 }
 
 namespace detail
 {
-  void socket_option_set(int_socket_type target, int level, int option, const void* value, int size)
-  {
-    using namespace std::string_literals;
-    if (setsockopt(target, level, option, (const char*)value, size) != 0)
-      throw std::runtime_error("failed to set socket option, error code : "s + 
-                              last_error_as_string());
-  }
-  
-  void socket_option_get(int_socket_type target, int level, int option, void* value, int size)
-  {
-    using namespace std::string_literals;
-    auto expected_size = size;
-    if (getsockopt(target, level, option, (char*)value, &size) != 0)
-      throw std::runtime_error("failed to get socket option, error code : "s + 
-                              last_error_as_string());
-    if (size != expected_size)
-      throw std::logic_error("socket option value size mismatch."s);
-  }
+	void socket_option_set(int_socket_type target, int level, int option, const void* value, int size)
+	{
+		if (setsockopt(native(target), level, option, (const char*)value, (socklen_type)size) != 0)
+			throw std::runtime_error("failed to set socket option : " + last_error_as_string());
+	}
+
+	void socket_option_get(int_socket_type target, int level, int option, void* value, int size)
+	{
+		auto actual_size = (socklen_type)size;
+		if (getsockopt(native(target), level, option, (char*)value, &actual_size) != 0)
+			throw std::runtime_error("failed to get socket option : " + last_error_as_string());
+		if (actual_size != (socklen_type)size)
+			throw std::logic_error("socket option value size mismatch.");
+	}
 }

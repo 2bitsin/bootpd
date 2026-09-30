@@ -1,57 +1,61 @@
 #pragma once
 
-#include <thread>
-#include <mutex>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 
-#include <common/config_ini.hpp>
-#include <common/lexical_cast.hpp>
-#include <common/concurrent_queue.hpp>
 #include <common/address_v4.hpp>
+#include <common/async.hpp>
+#include <common/config_ini.hpp>
 #include <common/socket_udp.hpp>
 
 #include "dhcp_options_v4.hpp"
 #include "dhcp_packet_v4.hpp"
 
+// Answers DHCP DISCOVER / REQUEST and plain BOOTP requests from the clients
+// listed (by MAC address) in the configuration. There is no address pool:
+// each known client gets exactly the parameters configured for it.
 struct dhcp_server_v4
 {
-	using packet_queue_type = concurrent_queue<std::tuple<address_v4, std::vector<std::byte>>>;
-	
-	dhcp_server_v4();
-	dhcp_server_v4(config_ini const&);
- ~dhcp_server_v4();
-	
-	void initialize(config_ini const&);
-
-	void start();
-	void cease();
-	
-
-protected:
-	struct offer_params
+	struct client_config
 	{
-		std::uint32_t			client_address;
-		std::uint32_t			your_address;
-		std::uint32_t			server_address;
-		std::uint32_t			gateway_address;
-		std::string				boot_file_name;
-		std::string				server_host_name;	
-		dhcp_options_v4		dhcp_options;			
-	};	
-	
-	using client_map_type = std::unordered_map<std::string, offer_params>;
-	
-	void initialize_client(offer_params& client_v, config_ini const& cfg, std::string_view client_mac);
-	auto make_offer(dhcp_packet_v4 const& packet, offer_params const& client_v) -> dhcp_packet_v4;
-	
-private:
-	void thread_incoming(std::stop_token st);
-	void thread_outgoing(std::stop_token st);
-	
+		std::uint32_t   your_address{ 0 };
+		std::uint32_t   server_address{ 0 };
+		std::string     boot_file_name;
+		std::string     server_host_name;
+		dhcp_options_v4 dhcp_options;
+	};
 
-	socket_udp					m_socket;	
-	packet_queue_type		m_packets;
-	address_v4					m_bind_address;
-	client_map_type     m_clients;
-	std::jthread				m_thread_incoming;
-	std::jthread				m_thread_outgoing;
+	using client_map_type = std::unordered_map<std::string, client_config>;
+
+	explicit dhcp_server_v4(config_ini const& cfg);
+
+	// "00:1C:7E:35:ED:20" -> "00-1c-7e-35-ed-20"
+	static auto normalize_mac(std::string_view mac) -> std::string;
+
+	// Opens the listening socket. Throws if the address can't be bound.
+	void bind();
+
+	// Serves requests until the context is stopped.
+	auto run(async::io_context& context) -> async::task<void>;
+
+	// Builds the reply for a request, std::nullopt if it should be ignored.
+	auto handle(dhcp_packet_v4 const& request) const -> std::optional<dhcp_packet_v4>;
+
+	// Where a reply to `request`, received from `source`, must be sent (RFC 2131, 4.1).
+	static auto reply_destination(dhcp_packet_v4 const& request, address_v4 const& source) -> address_v4;
+
+	auto bind_address() const noexcept -> address_v4 const&;
+	auto local_address() const -> address_v4;
+	auto clients() const noexcept -> client_map_type const&;
+
+private:
+	static auto load_client(config_ini const& cfg, std::string_view section) -> client_config;
+	auto make_reply(dhcp_packet_v4 const& request, client_config const& client) const -> dhcp_packet_v4;
+
+	address_v4      m_bind_address;
+	client_map_type m_clients;
+	socket_udp      m_socket;
 };

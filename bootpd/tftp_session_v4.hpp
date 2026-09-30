@@ -1,56 +1,59 @@
 #pragma once
 
-#include <stop_token>
-#include <thread>
-#include <functional>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <optional>
+#include <string_view>
 
 #include <common/address_v4.hpp>
-#include <common/config_ini.hpp>
+#include <common/async.hpp>
+#include <common/socket_udp.hpp>
 
-#include  "tftp_packet.hpp"
+#include "tftp_packet.hpp"
 
-
-struct tftp_server_v4;
-
+// One read (download) transfer, from the RRQ to the final ACK. Each session
+// runs as its own coroutine, with its own socket (and thus its own TID).
 struct tftp_session_v4
 {
-	static inline const constexpr auto MAX_RETRIES = 10u;
+	static inline constexpr auto MAX_RETRIES = 5u;
+
+	// Accepted option ranges (RFC 2348, RFC 2349)
+	static inline constexpr std::size_t MIN_BLKSIZE = 8u;
+	static inline constexpr std::size_t MAX_BLKSIZE = 65464u;
+	static inline constexpr std::uint32_t MIN_TIMEOUT = 1u;
+	static inline constexpr std::uint32_t MAX_TIMEOUT = 255u;
 
 	struct options_type
 	{
-		std::uintmax_t	blksize	{ 512u };
-		std::uintmax_t	timeout	{ 1u };
-		std::uintmax_t	tsize		{ 0u };
+		std::size_t   blksize { 512u };
+		std::uint32_t timeout { 1u };   // seconds
 	};
 
-	using notify_func_type = std::function<void(tftp_session_v4 const*)>;
+	struct negotiation_type
+	{
+		options_type options;
+		// Options to acknowledge in an OACK; empty means no OACK is sent.
+		tftp_packet::dictionary_type oack;
+	};
 
-	template <typename P, typename T>
-	tftp_session_v4(P& parent, address_v4 source, T const& request)
-	:	m_address		{ parent.address().port(0) },
-		m_base_dir	{ parent.base_dir() },
-		m_thread		{ [&parent, source, request, this] (auto st) { io_thread(parent, source, request, st); } }
-	{}
+	// Picks the options to use from those the client requested. Unknown or
+	// out of range options are ignored, as RFC 2347 allows.
+	static auto negotiate(tftp_packet::dictionary_type const& requested, std::uintmax_t file_size) -> negotiation_type;
 
-	bool is_done() const;
+	// Maps a requested file name to a path inside `base_dir`. Returns
+	// std::nullopt for names that would escape it ("..", absolute paths,
+	// symlinks pointing outside). Backslashes are treated as separators and a
+	// leading slash is relative to `base_dir`.
+	static auto resolve_path(std::filesystem::path const& base_dir, std::string_view filename) -> std::optional<std::filesystem::path>;
 
-  void validate_filepath(std::filesystem::path const& file_path_v, socket_udp& socket_v, address_v4 const& remote_client);
-	void validate_request(tftp_packet::type_rrq const& request, socket_udp& socket_v, address_v4 const& remote_client);	
-	
-	void validate_options(options_type& options_v, tftp_packet::type_rrq const& request_v, socket_udp& socket_v, address_v4 const& remote_client_v, std::stop_token token_v);
-	void validate_options(options_type& options_v, tftp_packet::type_wrq const& request_v, socket_udp& socket_v, address_v4 const& remote_client_v, std::stop_token token_v);	
+	// Serves a read request from `client`, from a new socket bound to `local` (port 0 = any).
+	static auto serve_read(async::io_context& context, address_v4 local, std::filesystem::path base_dir,
+		address_v4 client, tftp_packet::type_rrq request) -> async::task<void>;
 
-  void validate_ack(tftp_packet const& packet_v, socket_udp& socket_v, address_v4 const& remote_client_v, std::uintmax_t number_v);
-	void validate_source(address_v4 const& remote_client_v, address_v4 const& from_client_v, socket_udp& socket_v);
-	
-	void io_thread(tftp_server_v4& parent, address_v4 source, tftp_packet::type_rrq request, std::stop_token st);
-	void io_thread(tftp_server_v4& parent, address_v4 source, tftp_packet::type_wrq request, std::stop_token st);
-
-	
 private:
-	std::atomic<bool> m_done{ false };
-	address_v4 m_address;
-	std::filesystem::path m_base_dir;
-	std::jthread m_thread;
+	// Sends `packet` and waits for the ACK of `block_id`, retransmitting on timeout.
+	static auto exchange(async::io_context& context, socket_udp const& socket_v, address_v4 client,
+		tftp_packet packet, std::uint16_t block_id, std::chrono::seconds timeout) -> async::task<void>;
 };

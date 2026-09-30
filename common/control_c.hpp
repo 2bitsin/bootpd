@@ -1,11 +1,10 @@
 #pragma once
 
-#include <functional>
-#include <stop_token>
-
+// Graceful shutdown on Ctrl+C (and SIGTERM / console close).
 struct control_c
-{	
-	
-	static auto get_token() -> std::stop_token;
-	static auto stop_requested() -> bool;
+{
+	// Installs the handler. Safe to call more than once.
+	static void install();
+	static auto stop_requested() noexcept -> bool;
+	static void request_stop() noexcept;
 };

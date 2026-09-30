@@ -24,11 +24,14 @@ auto config_ini::parse(std::istream& iss)
 	std::string section_s;
 	std::size_t line_no{ 0 };
 	while (std::getline(iss, line_s))
-	{		
+	{
+		line_no += 1;
+		// Skip a UTF-8 byte order mark, as written by some Windows editors.
+		if (line_no == 1 && line_s.starts_with("\xEF\xBB\xBF"))
+			line_s.erase(0, 3);
 		if (line_s.empty())
 			continue;
-		line_no += 1;
-		parse_line(line_s, section_s, line_no);	
+		parse_line(line_s, section_s, line_no);
 	}
 	return *this;
 }
@@ -44,6 +47,11 @@ auto config_ini::sections() const -> std::vector<std::string_view>
 	for(auto&& [section_name, _] : m_data)
 		result.emplace_back(section_name);
 	return result;
+}
+
+auto config_ini::has_section(std::string_view section) const -> bool
+{
+	return m_data.contains(std::string(section));
 }
 
 auto config_ini::keynames(std::string_view section) const -> std::vector<std::string_view>
@@ -77,10 +85,17 @@ auto config_ini::parse_line(std::string_view line_sv, std::string& section, std:
 	static const auto re_section = std::regex(R"(^\[([^\[\]]*)\]$)", std::regex::optimize);	
 	static const auto re_kv_pair = std::regex(R"(^([^=]+)=(.*)$)", std::regex::optimize);
 
-	std::string_view::size_type pos;	
-	pos = line_sv.find(';');	
-	if (pos != line_sv.npos)
-		line_sv.remove_suffix(line_sv.size() - pos);
+	// Strip a trailing ';' comment, unless the ';' is inside double quotes.
+	bool in_quotes = false;
+	for (std::size_t pos = 0u; pos < line_sv.size(); ++pos)
+	{
+		if (line_sv[pos] == '"')
+			in_quotes = !in_quotes;
+		else if (line_sv[pos] == ';' && !in_quotes) {
+			line_sv.remove_suffix(line_sv.size() - pos);
+			break;
+		}
+	}
 	trim (line_sv);		
 	if (line_sv.empty ())
 		return *this;
@@ -88,14 +103,18 @@ auto config_ini::parse_line(std::string_view line_sv, std::string& section, std:
 	std::match_results<std::string_view::iterator> result;
 	if (std::regex_match(line_sv.begin(), line_sv.end(), result, re_section))
 	{
-		section = result[1].str();
+		std::string_view name_v(result[1].first, result[1].second);
+		trim(name_v);
+		section = std::string(name_v);
 		return *this;		
 	}
 	if (std::regex_match(line_sv.begin(), line_sv.end(), result, re_kv_pair))
 	{
 		std::string_view key(result[1].first, result[1].second);
 		trim(key);
-		if (key.front() == '"' && key.back() == '"') 
+		if (key.empty())
+			throw std::runtime_error(std::format("Missing key name on line {} : {}", line_no, line_sv));
+		if (key.size() >= 2u && key.front() == '"' && key.back() == '"')
 		{
 			key.remove_prefix(1);
 			key.remove_suffix(1);
@@ -103,7 +122,7 @@ auto config_ini::parse_line(std::string_view line_sv, std::string& section, std:
 
 		std::string_view val(result[2].first, result[2].second);
 		trim(val);
-		if (val.front() == '"' && val.back() == '"') 
+		if (val.size() >= 2u && val.front() == '"' && val.back() == '"')
 		{
 			val.remove_prefix(1);
 			val.remove_suffix(1);
